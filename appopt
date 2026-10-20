@@ -1,0 +1,428 @@
+appopt() {
+    local python_bin="" candidate
+
+    for candidate in python3 python python3.{20..0}; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+            "$candidate" -c \
+                'import sys; sys.exit(0 if sys.version_info >= (3, 6) else 1)' \
+                >/dev/null 2>&1; then
+            python_bin="$candidate"
+            break
+        fi
+    done
+
+    [[ -n "$python_bin" ]] || {
+        echo "Python 3.6 or newer was not found in PATH."
+        return 1
+    }
+
+    "$python_bin" - <<'PY'
+import os
+import pathlib
+import re
+import shutil
+import signal
+import subprocess
+from collections import defaultdict
+
+try:
+    os.nice(19)
+except OSError:
+    pass
+
+hostname = subprocess.check_output(
+    ["hostname", "-s"], universal_newlines=True
+).strip()
+
+base = pathlib.Path("/home") / (
+    "{}.cloudwaysapps.com".format(hostname)
+)
+
+if not base.is_dir():
+    print("Applications directory not found: {}".format(base))
+    raise SystemExit(1)
+
+base = base.resolve()
+warnings = []
+wp_binary = shutil.which("wp")
+
+def read_text(path):
+    return path.read_text(errors="replace")
+
+def service_status(units):
+    states = []
+
+    for unit in units:
+        try:
+            result = subprocess.run(
+                ["systemctl", "is-active", unit],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=5
+            )
+            state = result.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+        if state == "active":
+            return "Running ({})".format(unit)
+
+        if state in (
+            "inactive", "failed", "activating", "deactivating"
+        ):
+            states.append("{} ({})".format(state, unit))
+
+    return "; ".join(states) if states else "Unknown / unit not found"
+
+print("Server service status:")
+print("Varnish: {}".format(
+    service_status(["varnish.service"])
+))
+print("Redis:   {}".format(
+    service_status(["redis-server.service", "redis.service"])
+))
+print("\nChecking apps, Redis connectivity and prefetch warnings...")
+print(flush=True)
+
+# Read cron facts once.
+cron_path = pathlib.Path("/etc/ansible/facts.d/wp_cron.fact")
+cron_values = {}
+cron_readable = True
+
+try:
+    section = ""
+
+    for line in read_text(cron_path).splitlines():
+        line = line.strip()
+
+        if not line or line.startswith(("#", ";")):
+            continue
+
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+        elif section == "wp_cron" and "=" in line:
+            key, value = line.split("=", 1)
+            cron_values[key.strip()] = value.strip().lower()
+
+except FileNotFoundError:
+    pass
+except OSError:
+    cron_readable = False
+    warnings.append("Cannot read wp_cron.fact.")
+
+type_names = {
+    "wordpress": "WordPress",
+    "woocommerce": "WooCommerce",
+    "phpstack": "Custom PHP",
+    "laravel": "Laravel",
+    "magento": "Magento",
+}
+
+def varnish_status(name):
+    path = pathlib.Path("/etc/nginx/sites-enabled") / name
+
+    try:
+        text = read_text(path)
+    except OSError:
+        return "Unknown"
+
+    commented_marker = False
+
+    for line in text.splitlines():
+        if "UI_APP_LEVEL_VARNISH_DISABLE" not in line:
+            continue
+
+        if line.lstrip().startswith("#"):
+            commented_marker = True
+            continue
+
+        active_code = line.split("#", 1)[0]
+
+        if re.search(
+            r'\bset\s+\$varnish_status\s+["\']disable["\']\s*;',
+            active_code
+        ):
+            return "Disabled"
+
+    return "Enabled" if commented_marker else "Unknown"
+
+def redis_status(root):
+    if not wp_binary:
+        return "Skipped: WP-CLI missing"
+
+    plugins_dir = root / "wp-content/plugins"
+    redis_plugins = {"object-cache-pro", "redis-cache"}
+    skip_plugins = []
+
+    try:
+        for plugin in plugins_dir.iterdir():
+            if plugin.is_dir():
+                slug = plugin.name
+            elif plugin.is_file() and plugin.suffix == ".php":
+                slug = plugin.stem
+            else:
+                continue
+
+            if slug not in redis_plugins:
+                skip_plugins.append(slug)
+    except OSError:
+        return "Skipped: cannot read plugins"
+
+    command = [
+        wp_binary,
+        "--path={}".format(root),
+        "--skip-themes",
+        "--allow-root",
+        "--no-color",
+    ]
+
+    if skip_plugins:
+        command.append(
+            "--skip-plugins={}".format(",".join(sorted(skip_plugins)))
+        )
+
+    command.extend(["redis", "info"])
+
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            start_new_session=True
+        )
+    except OSError:
+        return "Skipped: command failed"
+
+    try:
+        output, errors = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+        process.communicate()
+        return "Skipped: timeout"
+
+    message = output + "\n" + errors
+
+    if re.search(
+        r"critical error|fatal error|uncaught",
+        message,
+        re.IGNORECASE
+    ):
+        return "Skipped: application error"
+
+    if process.returncode != 0:
+        if re.search(
+            r"""['"]redis['"] is not a registered wp command""",
+            message,
+            re.IGNORECASE
+        ):
+            return "Not connected"
+
+        return "Skipped: WP-CLI error"
+
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+
+    match = re.search(
+        r"^\s*Status:[ \t]*([^\r\n]+)",
+        output,
+        re.MULTILINE | re.IGNORECASE
+    )
+
+    if not match:
+        return "Skipped: no connection status"
+
+    status = match.group(1).strip().lower()
+
+    return {
+        "connected": "Connected",
+        "disconnected": "Not connected",
+        "not connected": "Not connected",
+        "disabled": "Not connected",
+        "not enabled": "Not connected",
+    }.get(status, "Skipped: unrecognized status")
+
+group_pattern = re.compile(
+    r"\bgroup\s+`([^`]+)`",
+    flags=re.IGNORECASE
+)
+
+def suggested_groups(app):
+    logs_dir = app / "logs"
+    found_groups = set()
+    matched = False
+    incomplete = False
+
+    if not logs_dir.is_dir():
+        return "No logs directory"
+
+    if not os.access(str(logs_dir), os.R_OK | os.X_OK):
+        return "Unknown: cannot read logs"
+
+    try:
+        for path in logs_dir.glob("backend_*.error.log"):
+            if not path.is_file():
+                continue
+
+            matched = True
+
+            try:
+                with path.open(errors="replace") as logfile:
+                    for line in logfile:
+                        if "incompatible with prefetching" not in line.lower():
+                            continue
+
+                        found_groups.update(group_pattern.findall(line))
+            except OSError:
+                incomplete = True
+
+    except OSError:
+        return "Unknown: cannot read logs"
+
+    if found_groups:
+        value = ", ".join(sorted(found_groups))
+        return value + (" (partial scan)" if incomplete else "")
+
+    if incomplete:
+        return "Unknown: partial scan"
+
+    return "None found" if matched else "No matching log"
+
+groups = defaultdict(list)
+seen = set()
+
+for entry in sorted(base.iterdir()):
+    try:
+        if not entry.is_dir():
+            continue
+
+        target = entry.resolve()
+
+        if target.parent != base or target in seen:
+            continue
+
+        if not (
+            (target / "conf").is_dir()
+            or (target / "public_html").is_dir()
+        ):
+            continue
+
+        seen.add(target)
+
+    except (OSError, RuntimeError):
+        continue
+
+    name = target.name
+    root = target / "public_html"
+    app_type = "Unknown"
+    url = "Unknown"
+
+    try:
+        nginx = read_text(target / "conf/server.nginx")
+        match = re.search(
+            r"^\s*server_name\s+([^;]+);",
+            nginx,
+            re.MULTILINE
+        )
+
+        if match:
+            host = next(
+                (
+                    value for value in match.group(1).split()
+                    if value.lower().endswith(".cloudwaysapps.com")
+                ),
+                None
+            )
+
+            if host:
+                url = "https://{}".format(host)
+                prefix = host.split("-", 1)[0].lower()
+                app_type = type_names.get(prefix, prefix)
+
+    except OSError:
+        pass
+
+    is_wp = (root / "wp-includes/version.php").is_file()
+
+    if is_wp:
+        if not cron_readable:
+            cron = "Unknown"
+        else:
+            value = cron_values.get(name, "")
+
+            if value == "enabled":
+                cron = "Enabled"
+            elif value in ("", "disabled", "disable"):
+                cron = "Disabled"
+            else:
+                cron = "Unknown"
+
+        redis = redis_status(root)
+        group_suggestions = suggested_groups(target)
+    else:
+        cron = "N/A"
+        redis = "N/A: non-WordPress"
+        group_suggestions = "N/A"
+
+    groups[app_type].append([
+        name,
+        url,
+        cron,
+        varnish_status(name),
+        redis,
+        group_suggestions,
+    ])
+
+print("Total applications: {}".format(
+    sum(len(rows) for rows in groups.values())
+))
+
+print("\nApplication count by type:")
+for app_type in sorted(groups, key=str.casefold):
+    print("{}: {}".format(app_type, len(groups[app_type])))
+
+headers = [
+    "app_name",
+    "Default URL",
+    "Cron optimizer",
+    "Varnish",
+    "Redis connectivity",
+    "Suggested groups",
+]
+
+for app_type in sorted(groups, key=str.casefold):
+    rows = sorted(groups[app_type])
+
+    print("\n=== {} ({}) ===\n".format(app_type, len(rows)))
+
+    widths = [
+        max(len(str(row[i])) for row in [headers] + rows)
+        for i in range(len(headers))
+    ]
+
+    for index, row in enumerate([headers] + rows):
+        print(" | ".join(
+            str(value).ljust(widths[i])
+            for i, value in enumerate(row)
+        ))
+
+        if index == 0:
+            print("-+-".join("-" * width for width in widths))
+
+print("\nVarnish: app configuration status.")
+print("Redis: wp redis info only; no diagnostic cache keys.")
+print("Missing Redis command is labelled Not connected.")
+print("Other normal plugins/themes skipped; MU plugins/drop-ins may load.")
+print("Redis checks: sequential, low CPU priority, 5-second timeout.")
+print("Suggested groups: full matching backend_*.error.log scan.")
+print("Warnings may be historical; no configuration is changed.")
+
+for warning in warnings:
+    print("Warning: {}".format(warning))
+PY
+}
